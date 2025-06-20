@@ -2,6 +2,7 @@ import streamlit as st
 import torch
 from model import GenePanelGNN
 import pandas as pd
+import json
 
 
 
@@ -15,6 +16,10 @@ gene2idx  = ckpt['gene2idx'];  panel2idx = ckpt['panel2idx']
 data = ckpt['data']
 idx2panel = {v: k for k, v in panel2idx.items()}
 
+with open('panelid2name.json', 'r') as f:
+    panelid2name = json.load(f)
+
+name2panelid = {v: k for k, v in panelid2name.items()}
 # ------------------------------------------
 def ensure_gene(gene_symbol: str,
                 feat: torch.Tensor | None = None) -> int:
@@ -46,24 +51,29 @@ def add_edge(gid: int, pid: int):
 
 
 # Simple user inputs
-panel = st.text_area("Enter your node or graph data (JSON):")
+# panel = st.text_area("Enter your node or graph data (JSON):")
+panels = st.multiselect("Select a panel",
+    options=list(name2panelid.keys()))
+
 
 if st.button("Predict"):
     try:
-        panel = int(panel)
-        gene   = 'MYNEWGENE'       # HGNC symbol just entered by a curator
 
-        gid = ensure_gene(panel)              # create/lookup the gene
-        pid = panel2idx[panel]               # panels were pre-indexed
-        add_edge(gid, pid)                   # store the new membership
-        x_dict = {
-            'gene' : data['gene'].x,
-            'panel': data['panel'].x,
-        }
-        edge_index_dict = {
-            ('gene',  'in',     'panel'): data['gene',  'in',     'panel'].edge_index,
-            ('panel', 'rev_in', 'gene' ): data['panel', 'rev_in', 'gene' ].edge_index,
-        }
+        for panel in panels:
+            panel = int(name2panelid[panel])
+            gene   = 'MYNEWGENE'       # HGNC symbol just entered by a curator
+
+            gid = ensure_gene(panel)              # create/lookup the gene
+            pid = panel2idx[panel]               # panels were pre-indexed
+            add_edge(gid, pid)                   # store the new membership
+            x_dict = {
+                'gene' : data['gene'].x,
+                'panel': data['panel'].x,
+            }
+            edge_index_dict = {
+                ('gene',  'in',     'panel'): data['gene',  'in',     'panel'].edge_index,
+                ('panel', 'rev_in', 'gene' ): data['panel', 'rev_in', 'gene' ].edge_index,
+            }
         # ------------------------------------------
         # 4. score every *other* panel for this gene
         # ------------------------------------------
