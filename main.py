@@ -87,7 +87,7 @@ if st.button("Predict"):
 
         top = torch.topk(scores, k=10).indices          # best 10
         suggestions = pd.DataFrame({
-            "panel_id": [int(idx2panel[cand_pids[i].item()]) for i in top],
+            "panel_id": [panelid2name.get(str(int(idx2panel[cand_pids[i].item()])), f"Panel {int(idx2panel[cand_pids[i].item()])}") for i in top],
             "score": [round(float(scores[i]), 3) for i in top]
         })
         # suggestions = "".join([f"{str(int(idx2panel[int(cand_pids[i])]))}, {str(round(float(scores[i]),3))}\n" for i in top])
