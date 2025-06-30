@@ -3,6 +3,10 @@ venv/
 env/
 .env/
 
+# Data cache files
+gene2panel_cache.pkl
+*.pkl
+
 # Python cache
 __pycache__/
 *.py[cod]
