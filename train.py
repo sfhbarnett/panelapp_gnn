@@ -103,39 +103,109 @@ def create_graph_data(gene2panel):
     
     return data, gene2idx, panel2idx, idx2panel
 
+def manual_edge_split(edge_index, val_ratio=0.15, test_ratio=0.15):
+    """Properly split edges for directed bipartite graphs"""
+    num_edges = edge_index.size(1)
+    perm = torch.randperm(num_edges)
+    
+    # Calculate split indices
+    test_size = int(test_ratio * num_edges)
+    val_size = int(val_ratio * num_edges)
+    train_size = num_edges - test_size - val_size
+    
+    # Split indices
+    train_idx = perm[:train_size]
+    val_idx = perm[train_size:train_size + val_size]
+    test_idx = perm[train_size + val_size:]
+    
+    return {
+        'train': edge_index[:, train_idx],
+        'val': edge_index[:, val_idx], 
+        'test': edge_index[:, test_idx]
+    }
 
-def train_model(data, gene2idx, panel2idx, epochs=100, lr=1e-3, hidden_dim=128):
-    """Train the GNN model"""
+def train_model(data, gene2idx, panel2idx, epochs=200, lr=1e-3, hidden_dim=128):
+    """Train the GNN model with proper train/val split to avoid data leakage"""
     print("Starting model training...")
     
-    # Initialize model
-    model = GenePanelGNN(hidden=hidden_dim)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    # Split data ONCE before training to avoid leakage
+    # split = RandomLinkSplit(
+    #     num_val=0.15,
+    #     num_test=0.15,
+    #     edge_types=[('gene', 'in', 'panel')],
+    #     rev_edge_types=[('panel', 'rev_in', 'gene')],
+    #     is_undirected=True
+    # )
     
-    # Prepare data dictionaries
+    print("Starting model training...")
+    
+    # Manual edge split to avoid leakage
+    original_edges = data['gene', 'in', 'panel'].edge_index
+    splits = manual_edge_split(original_edges)
+    
+    # Create new data objects with split edges
+    train_data = data.clone()
+    val_data = data.clone()
+    test_data = data.clone()
+    
+    # Update edge indices for each split
+    train_data['gene', 'in', 'panel'].edge_index = splits['train']
+    train_data['panel', 'rev_in', 'gene'].edge_index = splits['train'].flip(0)  # Reverse edges
+    
+    val_data['gene', 'in', 'panel'].edge_index = splits['val']
+    val_data['panel', 'rev_in', 'gene'].edge_index = splits['val'].flip(0)
+    
+    test_data['gene', 'in', 'panel'].edge_index = splits['test']
+    test_data['panel', 'rev_in', 'gene'].edge_index = splits['test'].flip(0)
+    
+    # Debug: Check split sizes
+    total_edges = original_edges.size(1)
+    train_edges = train_data['gene', 'in', 'panel'].edge_index.size(1)
+    val_edges = val_data['gene', 'in', 'panel'].edge_index.size(1)
+    test_edges = test_data['gene', 'in', 'panel'].edge_index.size(1)
+    print(f"Total edges: {total_edges}, Train: {train_edges}, Val: {val_edges}, Test: {test_edges}")
+    
+    # Verify no overlap
+    train_set = set(map(tuple, splits['train'].t().tolist()))
+    val_set = set(map(tuple, splits['val'].t().tolist()))
+    print(f"Edge overlap after manual split: {len(train_set.intersection(val_set))}")
+    
+    # Rest of your training code stays the same...
+    model = GenePanelGNN(hidden=hidden_dim)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-2)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
+
+    
+    # Prepare data dictionaries (use ONLY training edges)
     x_dict = {
         'gene': data['gene'].x,
         'panel': data['panel'].x
     }
     edge_index_dict = {
-        ('gene', 'in', 'panel'): data['gene', 'in', 'panel'].edge_index,
-        ('panel', 'rev_in', 'gene'): data['panel', 'rev_in', 'gene'].edge_index
+        ('gene', 'in', 'panel'): train_data['gene', 'in', 'panel'].edge_index,
+        ('panel', 'rev_in', 'gene'): train_data['panel', 'rev_in', 'gene'].edge_index
     }
     
-    pos_edge_index = data['gene', 'in', 'panel'].edge_index
+    train_pos_edges = train_data['gene', 'in', 'panel'].edge_index
     n_genes, n_panels = data['gene'].num_nodes, data['panel'].num_nodes
     
-    model.train()
+    best_val_auc = 0
+    patience = 10
+    patience_counter = 0
+    
     for epoch in range(epochs):
-        # Sample negative edges
+        model.train()
+        
+        # Sample negative edges from training set only
         neg_edges = negative_sampling(
-            pos_edge_index, 
+            train_pos_edges, 
             num_nodes=(n_genes, n_panels),
-            num_neg_samples=pos_edge_index.size(1)
+            num_neg_samples=train_pos_edges.size(1),
+            method='sparse'
         )
         
-        # Forward pass
-        pos_score = model(x_dict, edge_index_dict, pos_edge_index)
+        # Forward pass on training edges only
+        pos_score = model(x_dict, edge_index_dict, train_pos_edges)
         neg_score = model(x_dict, edge_index_dict, neg_edges)
         
         # Compute loss
@@ -149,29 +219,94 @@ def train_model(data, gene2idx, panel2idx, epochs=100, lr=1e-3, hidden_dim=128):
         loss.backward()
         optimizer.step()
         
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}")
+        # Evaluate on validation set
+        if (epoch + 1) % 5 == 0:
+            val_auc, val_acc, val_loss = evaluate_on_validation(model, data, train_data, val_data)
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}, Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}, Val Acc: {val_acc:.4f}")
+            
+            # Learning rate scheduling
+            scheduler.step(val_auc)
+            
+            # Early stopping
+            if val_auc > best_val_auc:
+                best_val_auc = val_auc
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
     
+    print(f"Best validation AUC: {best_val_auc:.4f}")
     return model
 
 
-def evaluate_model(model, data):
-    """Evaluate the trained model"""
-    print("Evaluating model...")
+def evaluate_on_validation(model, data, train_data, val_data):
+    """Evaluate model on validation edges during training"""
+    from sklearn.metrics import roc_auc_score, accuracy_score
     
-    # Split data for evaluation
+    model.eval()
+    with torch.no_grad():
+        # Prepare data with training edges only
+        x_dict = {
+            'gene': data['gene'].x,
+            'panel': data['panel'].x
+        }
+        edge_index_dict = {
+            ('gene', 'in', 'panel'): train_data['gene', 'in', 'panel'].edge_index,
+            ('panel', 'rev_in', 'gene'): train_data['panel', 'rev_in', 'gene'].edge_index
+        }
+        
+        # Use validation edges for evaluation
+        val_pos_edges = val_data['gene', 'in', 'panel'].edge_index
+        val_neg_edges = negative_sampling(
+            val_pos_edges,
+            num_nodes=(data['gene'].num_nodes, data['panel'].num_nodes),
+            num_neg_samples=val_pos_edges.size(1)
+        )
+        
+        # Get predictions (raw logits for loss calculation)
+        pos_logits = model(x_dict, edge_index_dict, val_pos_edges)
+        neg_logits = model(x_dict, edge_index_dict, val_neg_edges)
+        
+        # Calculate validation loss
+        val_loss = F.binary_cross_entropy_with_logits(
+            torch.cat([pos_logits, neg_logits]),
+            torch.cat([torch.ones_like(pos_logits), torch.zeros_like(neg_logits)])
+        )
+        
+        # Get sigmoid scores for metrics
+        pos_scores = torch.sigmoid(pos_logits)
+        neg_scores = torch.sigmoid(neg_logits)
+        
+        # Calculate metrics
+        y_true = torch.cat([torch.ones_like(pos_scores), torch.zeros_like(neg_scores)]).cpu().numpy()
+        y_scores = torch.cat([pos_scores, neg_scores]).cpu().numpy()
+        
+        auc = roc_auc_score(y_true, y_scores)
+        accuracy = ((y_scores > 0.5) == y_true).mean()
+        
+    model.train()
+    return auc, accuracy, val_loss.item()
+
+
+def evaluate_model(model, data):
+    """Evaluate the trained model on test set"""
+    print("Final evaluation on test set...")
+    
+    # Create same split as training (this should be consistent)
     split = RandomLinkSplit(
-        num_val=0.10,
-        num_test=0.10,
+        num_val=0.15,
+        num_test=0.15,
         edge_types=[('gene', 'in', 'panel')],
         rev_edge_types=[('panel', 'rev_in', 'gene')],
-        add_negative_train_samples=False,
         is_undirected=False
     )
     
     train_data, val_data, test_data = split(data)
     
-    # Prepare data for evaluation
+    # Prepare data for evaluation (using training edges only)
     x_dict = {
         'gene': data['gene'].x,
         'panel': data['panel'].x
@@ -183,17 +318,17 @@ def evaluate_model(model, data):
     
     model.eval()
     with torch.no_grad():
-        # Test on validation edges
-        val_pos_edges = val_data['gene', 'in', 'panel'].edge_index
-        val_neg_edges = negative_sampling(
-            val_pos_edges,
+        # Test on TEST edges (not validation)
+        test_pos_edges = test_data['gene', 'in', 'panel'].edge_index
+        test_neg_edges = negative_sampling(
+            test_pos_edges,
             num_nodes=(data['gene'].num_nodes, data['panel'].num_nodes),
-            num_neg_samples=val_pos_edges.size(1)
+            num_neg_samples=test_pos_edges.size(1)
         )
         
         # Get predictions
-        pos_scores = torch.sigmoid(model(x_dict, edge_index_dict, val_pos_edges))
-        neg_scores = torch.sigmoid(model(x_dict, edge_index_dict, val_neg_edges))
+        pos_scores = torch.sigmoid(model(x_dict, edge_index_dict, test_pos_edges))
+        neg_scores = torch.sigmoid(model(x_dict, edge_index_dict, test_neg_edges))
         
         # Calculate metrics
         y_true = torch.cat([torch.ones_like(pos_scores), torch.zeros_like(neg_scores)]).cpu().numpy()
@@ -203,8 +338,8 @@ def evaluate_model(model, data):
         auc = roc_auc_score(y_true, y_scores)
         accuracy = accuracy_score(y_true, y_pred)
         
-        print(f"Validation AUC: {auc:.4f}")
-        print(f"Validation Accuracy: {accuracy:.4f}")
+        print(f"Test AUC: {auc:.4f}")
+        print(f"Test Accuracy: {accuracy:.4f}")
     
     return auc, accuracy
 
@@ -236,7 +371,7 @@ def main():
     data, gene2idx, panel2idx, idx2panel = create_graph_data(gene2panel)
     
     # Train model
-    model = train_model(data, gene2idx, panel2idx, epochs=100)
+    model = train_model(data, gene2idx, panel2idx, epochs=200)
     
     # Evaluate model
     auc, accuracy = evaluate_model(model, data)
