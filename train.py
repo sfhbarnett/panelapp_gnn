@@ -103,6 +103,45 @@ def create_graph_data(gene2panel):
     
     return data, gene2idx, panel2idx, idx2panel
 
+def compute_degree_weights(data, train_data, alpha=0.5):
+    """
+    Compute degree-based weights to downweight high-degree nodes.
+    
+    Args:
+        data: Full graph data
+        train_data: Training split data
+        alpha: Weighting factor (0=no weighting, 1=strong inverse weighting)
+    
+    Returns:
+        gene_weights, panel_weights: Tensors with weights for each node
+    """
+    # Compute degrees for genes and panels from training edges
+    train_edges = train_data['gene', 'in', 'panel'].edge_index
+    
+    # Gene degrees (number of panels each gene is connected to)
+    gene_degrees = torch.zeros(data['gene'].num_nodes)
+    panel_degrees = torch.zeros(data['panel'].num_nodes)
+    
+    for gene_idx, panel_idx in train_edges.T:
+        gene_degrees[gene_idx] += 1
+        panel_degrees[panel_idx] += 1
+    
+    # Convert to weights: higher degree = lower weight
+    # Add small epsilon to avoid division by zero
+    eps = 1e-6
+    gene_weights = 1.0 / (gene_degrees + eps)
+    panel_weights = 1.0 / (panel_degrees + eps)
+    
+    # Apply alpha scaling: alpha=0 means no weighting (all weights=1)
+    gene_weights = (1 - alpha) + alpha * (gene_weights / gene_weights.max())
+    panel_weights = (1 - alpha) + alpha * (panel_weights / panel_weights.max())
+    
+    print(f"Degree weighting: genes [{gene_weights.min():.3f}, {gene_weights.max():.3f}], "
+          f"panels [{panel_weights.min():.3f}, {panel_weights.max():.3f}]")
+    
+    return gene_weights, panel_weights
+
+
 def manual_edge_split(edge_index, val_ratio=0.15, test_ratio=0.15):
     """Properly split edges for directed bipartite graphs"""
     num_edges = edge_index.size(1)
@@ -124,7 +163,7 @@ def manual_edge_split(edge_index, val_ratio=0.15, test_ratio=0.15):
         'test': edge_index[:, test_idx]
     }
 
-def train_model(data, gene2idx, panel2idx, epochs=200, lr=1e-3, hidden_dim=128):
+def train_model(data, gene2idx, panel2idx, epochs=200, lr=1e-3, hidden_dim=128, degree_weighting=0.3, dropout=0.5):
     """Train the GNN model with proper train/val split to avoid data leakage"""
     print("Starting model training...")
     
@@ -171,7 +210,7 @@ def train_model(data, gene2idx, panel2idx, epochs=200, lr=1e-3, hidden_dim=128):
     print(f"Edge overlap after manual split: {len(train_set.intersection(val_set))}")
     
     # Rest of your training code stays the same...
-    model = GenePanelGNN(hidden=hidden_dim)
+    model = GenePanelGNN(hidden=hidden_dim, dropout=dropout)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-2)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10, factor=0.5)
 
@@ -188,6 +227,9 @@ def train_model(data, gene2idx, panel2idx, epochs=200, lr=1e-3, hidden_dim=128):
     
     train_pos_edges = train_data['gene', 'in', 'panel'].edge_index
     n_genes, n_panels = data['gene'].num_nodes, data['panel'].num_nodes
+    
+    # Compute degree-based weights to reduce bias toward high-degree nodes
+    gene_weights, panel_weights = compute_degree_weights(data, train_data, degree_weighting)
     
     best_val_auc = 0
     patience = 10
@@ -208,11 +250,27 @@ def train_model(data, gene2idx, panel2idx, epochs=200, lr=1e-3, hidden_dim=128):
         pos_score = model(x_dict, edge_index_dict, train_pos_edges)
         neg_score = model(x_dict, edge_index_dict, neg_edges)
         
-        # Compute loss
-        loss = F.binary_cross_entropy_with_logits(
-            torch.cat([pos_score, neg_score]),
-            torch.cat([torch.ones_like(pos_score), torch.zeros_like(neg_score)])
-        )
+        # Compute degree-weighted loss
+        # Get weights for each edge based on the genes and panels involved
+        pos_gene_weights = gene_weights[train_pos_edges[0]]
+        pos_panel_weights = panel_weights[train_pos_edges[1]]
+        neg_gene_weights = gene_weights[neg_edges[0]]
+        neg_panel_weights = panel_weights[neg_edges[1]]
+        
+        # Combine gene and panel weights (geometric mean)
+        pos_edge_weights = torch.sqrt(pos_gene_weights * pos_panel_weights)
+        neg_edge_weights = torch.sqrt(neg_gene_weights * neg_panel_weights)
+        
+        # Apply weights to the loss
+        pos_loss = F.binary_cross_entropy_with_logits(
+            pos_score, torch.ones_like(pos_score), reduction='none'
+        ) * pos_edge_weights
+        
+        neg_loss = F.binary_cross_entropy_with_logits(
+            neg_score, torch.zeros_like(neg_score), reduction='none'
+        ) * neg_edge_weights
+        
+        loss = (pos_loss.mean() + neg_loss.mean()) / 2
         
         # Backward pass
         optimizer.zero_grad()
@@ -370,8 +428,8 @@ def main():
     # Create graph
     data, gene2idx, panel2idx, idx2panel = create_graph_data(gene2panel)
     
-    # Train model
-    model = train_model(data, gene2idx, panel2idx, epochs=200)
+    # Train model with degree weighting and dropout
+    model = train_model(data, gene2idx, panel2idx, epochs=200, degree_weighting=0.1, dropout=0.5)
     
     # Evaluate model
     auc, accuracy = evaluate_model(model, data)
